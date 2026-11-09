@@ -10,13 +10,14 @@
     { key: "friday", label: "Friday", short: "Fri" },
     { key: "saturday", label: "Saturday", short: "Sat" }
   ];
+  const HOURS_PER_DAY = 8;
   const PAGE_NAMES = { overview: "Overview", workers: "Workers", payroll: "Weekly payroll", positions: "Positions", sites: "Work sites", deleted: "Removed workers" };
   const pageContent = document.getElementById("page-content");
   const dialog = document.getElementById("app-dialog");
   const authScreen = document.getElementById("auth-screen");
   const appShell = document.getElementById("app-shell");
   let page = "overview";
-  let currentWeek = weekStart(new Date());
+  let currentWeek = previousWeekStart(new Date());
   let toastTimer;
   let saveQueue = Promise.resolve();
   let dataLoading = true;
@@ -36,6 +37,17 @@
       record.resultingPcaBalance = balance;
     });
     person.pcaBalance = balance;
+  }
+  function projectedPcaBalance(person, editedRecord, week, newAmount, deduction) {
+    if (!person) return 0;
+    let balance = number(person.initialPcaBalance != null ? person.initialPcaBalance : person.pcaBalance);
+    const precedingRecords = data.payroll
+      .filter(record => record.workerId === person.id && record.id !== (editedRecord && editedRecord.id) && record.weekStart < week)
+      .sort((a, b) => a.weekStart.localeCompare(b.weekStart) || String(a.createdAt).localeCompare(String(b.createdAt)));
+    precedingRecords.forEach(record => {
+      balance = Math.max(0, balance + number(record.newPcaAmount) - number(record.pcaDeduction));
+    });
+    return Math.max(0, balance + newAmount - deduction);
   }
   function save() {
     const request = saveQueue.catch(() => {}).then(async () => {
@@ -97,12 +109,21 @@
   function weekStart(date) {
     const copy = new Date(date);
     copy.setHours(0, 0, 0, 0);
-    const offset = (copy.getDay() + 6) % 7;
-    copy.setDate(copy.getDate() - offset);
+    copy.setDate(copy.getDate() - copy.getDay());
     return copy;
+  }
+  function previousWeekStart(date) {
+    const start = weekStart(date);
+    start.setDate(start.getDate() - 7);
+    return start;
   }
   function weekEnd(start) { const result = new Date(start); result.setDate(result.getDate() + 6); return result; }
   function weekKey(date) { return isoDate(weekStart(new Date(`${date}T00:00:00`))); }
+  function weekdayDate(week, day) {
+    const date = new Date(`${week}T00:00:00`);
+    date.setDate(date.getDate() + DAYS.indexOf(day));
+    return isoDate(date);
+  }
   function weekLabel(start) {
     const end = weekEnd(start);
     return `${start.toLocaleDateString("en-PH", { month: "short", day: "numeric" })} – ${end.toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" })}`;
@@ -119,9 +140,14 @@
     const job = position(person.positionId);
     return person.overrideRate !== "" && person.overrideRate != null ? number(person.overrideRate) : number(job && job.dailyRate);
   }
+  function recordHours(record) {
+    return (record.days || []).reduce((sum, entry) => sum + number(entry.hours), 0);
+  }
+  function recordUnits(record) {
+    return recordHours(record) / HOURS_PER_DAY;
+  }
   function calcTotal(record) {
-    const hours = DAYS.reduce((sum, day) => sum + number(record[`${day.key}Hours`]), 0) + number(record.otherHours);
-    return hours * number(record.effectiveRate) + number(record.allowanceAmount) - number(record.cashAdvance) - number(record.pcaDeduction);
+    return Math.round((recordUnits(record) * number(record.effectiveRate) + number(record.allowanceAmount) - number(record.cashAdvance) - number(record.pcaDeduction)) * 100) / 100;
   }
   function persistAndRender(message) {
     save().then(() => {
@@ -172,7 +198,7 @@
       if (!activeFilters.from && !activeFilters.to && record.weekStart !== isoDate(currentWeek)) return false;
       if (activeFilters.worker && record.workerId !== activeFilters.worker) return false;
       if (activeFilters.position && (!person || person.positionId !== activeFilters.position)) return false;
-      if (activeFilters.site && !DAYS.some(day => record[`${day.key}SiteId`] === activeFilters.site) && record.otherSiteId !== activeFilters.site) return false;
+      if (activeFilters.site && !(record.days || []).some(day => day.siteId === activeFilters.site)) return false;
       const date = record.weekStart;
       if (activeFilters.from && date < activeFilters.from) return false;
       if (activeFilters.to && date > activeFilters.to) return false;
@@ -197,21 +223,22 @@
     const rows = records.map(record => {
       const person = workerForRecord(record.workerId);
       const job = position(person && person.positionId);
-      const siteIds = [...new Set(DAYS.map(day => record[`${day.key}SiteId`]).concat(record.otherSiteId).filter(Boolean))];
+      const siteIds = [...new Set((record.days || []).map(day => day.siteId).filter(Boolean))];
       const siteNames = siteIds.map(siteId => site(siteId)).filter(Boolean).map(item => item.name);
       return `<tr>
         ${showChecks ? `<td class="check-cell"><input type="checkbox" class="record-check" value="${esc(record.id)}" aria-label="Select ${esc(workerName(record))} payroll"></td>` : ""}
         <td>${workerCell(person, job ? job.title : "Position not set")}</td>
         <td>${esc(weekLabel(new Date(`${record.weekStart}T00:00:00`)))}</td>
         <td>${esc(siteNames.join(", ") || "—")}</td>
-        <td>${money(record.effectiveRate)}<div class="rate-note">per hour</div></td>
+        <td>${recordHours(record).toFixed(2)}<div class="rate-note">${recordUnits(record).toFixed(2)} day units</div></td>
+        <td>${money(record.effectiveRate)}<div class="rate-note">per day</div></td>
         <td>${money(record.allowanceAmount)}</td>
         <td>${money(record.cashAdvance)}</td>
         <td class="pay-value">${money(record.totalPay)}</td>
         <td><div class="row-actions"><button class="icon-btn" data-action="edit-payroll" data-id="${esc(record.id)}" title="Edit">✎</button><button class="icon-btn" data-action="print-record" data-id="${esc(record.id)}" title="Print payslip">▤</button><button class="icon-btn delete" data-action="delete-payroll" data-id="${esc(record.id)}" title="Delete">×</button></div></td>
       </tr>`;
     }).join("");
-    return `<table><thead><tr>${showChecks ? "<th></th>" : ""}<th>Worker</th><th>Week</th><th>Site(s)</th><th>Rate</th><th>Allowance</th><th>Cash advance</th><th>Net pay</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    return `<table><thead><tr>${showChecks ? "<th></th>" : ""}<th>Worker</th><th>Week</th><th>Site(s)</th><th>Hours / units</th><th>Daily rate</th><th>Allowance</th><th>Cash advance</th><th>Net pay</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
   }
   function renderOverview() {
     const thisWeek = payrollForWeek(currentWeek);
@@ -247,10 +274,10 @@
         <select id="worker-position-filter" class="field-control">${selectOptions(data.positions, positionFilter, "All positions", item => item.title)}</select>
         <span class="muted" style="font-size:9px;margin-left:auto">${records.length} worker${records.length === 1 ? "" : "s"}</span>
       </div>
-      ${records.length ? tableCard(`<table><thead><tr><th>Worker</th><th>Position</th><th>Site</th><th>Effective rate</th><th>Phone</th><th>PCA balance</th><th>Status</th><th></th></tr></thead><tbody>${records.map(person => {
+      ${records.length ? tableCard(`<table><thead><tr><th>Worker</th><th>Position</th><th>Site</th><th>Effective daily rate</th><th>Phone</th><th>PCA balance</th><th>Status</th><th></th></tr></thead><tbody>${records.map(person => {
         const job = position(person.positionId);
         const workSite = site(person.siteId);
-        return `<tr><td>${workerCell(person, person.phone || "No phone number")}</td><td>${esc(job ? job.title : "—")}</td><td>${esc(workSite ? workSite.name : "—")}</td><td>${money(effectiveRate(person))}<div class="rate-note">${person.overrideRate !== "" && person.overrideRate != null ? "Worker override" : "Position default"}</div></td><td>${esc(person.phone || "—")}</td><td class="${number(person.pcaBalance) > 0 ? "pca-positive" : ""}">${money(person.pcaBalance)}</td><td><span class="pill green">Active</span></td><td><div class="row-actions"><button class="icon-btn" data-action="worker-history" data-id="${esc(person.id)}" title="Pay history">◷</button><button class="icon-btn" data-action="edit-worker" data-id="${esc(person.id)}" title="Edit">✎</button><button class="icon-btn delete" data-action="remove-worker" data-id="${esc(person.id)}" title="Remove">×</button></div></td></tr>`;
+        return `<tr><td>${workerCell(person, person.phone || "No phone number")}</td><td>${esc(job ? job.title : "—")}</td><td>${esc(workSite ? workSite.name : "—")}</td><td>${money(effectiveRate(person))}<div class="rate-note">${person.overrideRate !== "" && person.overrideRate != null ? "Worker override" : "Position default"} · per day</div></td><td>${esc(person.phone || "—")}</td><td class="${number(person.pcaBalance) > 0 ? "pca-positive" : ""}">${money(person.pcaBalance)}</td><td><span class="pill green">Active</span></td><td><div class="row-actions"><button class="icon-btn" data-action="worker-history" data-id="${esc(person.id)}" title="Pay history">◷</button><button class="icon-btn" data-action="edit-worker" data-id="${esc(person.id)}" title="Edit">✎</button><button class="icon-btn delete" data-action="remove-worker" data-id="${esc(person.id)}" title="Remove">×</button></div></td></tr>`;
       }).join("")}</tbody></table>`) : emptyState(search || siteFilter || positionFilter ? "No workers match these filters" : "No workers added yet", "Add workers to start managing assignments and payroll.")}</section>`;
   }
   function renderPositions() {
@@ -262,18 +289,24 @@
       }).join("")}</tbody></table>`) : emptyState("No positions added", "Create job positions and set a default rate.")}</section>`;
   }
   function renderSites() {
-    return `${heading("Work sites", "Manage locations and keep timesheet hours connected to each site.", `<button class="btn btn-primary" data-action="add-site">＋ Add work site</button>`)}
-      <section class="panel"><div class="panel-header"><div><h2>All work sites</h2><p>Workers can be assigned a primary site. Each timesheet day can use a different site.</p></div></div>
-      ${data.sites.length ? tableCard(`<table><thead><tr><th>Site name</th><th>Location</th><th>Assigned workers</th><th>Payroll records</th><th></th></tr></thead><tbody>${data.sites.map(workSite => {
+    return `${heading("Work sites", "Manage locations, daily attendance, and labor costs by site.", `<button class="btn btn-primary" data-action="add-site">＋ Add work site</button>`)}
+      <section class="panel"><div class="panel-header"><div><h2>All work sites</h2><p>Labor cost is allocated by each recorded day's hours and the worker's saved daily rate.</p></div></div>
+      ${data.sites.length ? tableCard(`<table><thead><tr><th>Site name</th><th>Location</th><th>Assigned workers</th><th>Payroll records</th><th>Hours</th><th>Pay units</th><th>Labor cost</th><th></th></tr></thead><tbody>${data.sites.map(workSite => {
         const assigned = activeWorkers().filter(person => person.siteId === workSite.id).length;
-        const records = data.payroll.filter(record => DAYS.some(day => record[`${day.key}SiteId`] === workSite.id) || record.otherSiteId === workSite.id).length;
-        return `<tr><td><strong style="color:#35425a">${esc(workSite.name)}</strong></td><td>${esc(workSite.location || "—")}</td><td>${assigned}</td><td>${records}</td><td><div class="row-actions"><button class="icon-btn" data-action="edit-site" data-id="${esc(workSite.id)}" title="Edit">✎</button><button class="icon-btn delete" data-action="delete-site" data-id="${esc(workSite.id)}" title="Delete">×</button></div></td></tr>`;
+        const siteRecords = data.payroll.filter(record => (record.days || []).some(day => day.siteId === workSite.id));
+        const siteEntries = data.payroll.flatMap(record => (record.days || [])
+          .filter(day => day.siteId === workSite.id)
+          .map(day => ({ record, day })));
+        const hours = siteEntries.reduce((sum, entry) => sum + number(entry.day.hours), 0);
+        const units = hours / HOURS_PER_DAY;
+        const laborCost = siteEntries.reduce((sum, entry) => sum + number(entry.day.hours) / HOURS_PER_DAY * number(entry.record.effectiveRate), 0);
+        return `<tr><td><strong style="color:#35425a">${esc(workSite.name)}</strong></td><td>${esc(workSite.location || "—")}</td><td>${assigned}</td><td>${siteRecords.length}</td><td>${hours.toFixed(2)}</td><td>${units.toFixed(2)}</td><td class="pay-value">${money(laborCost)}</td><td><div class="row-actions"><button class="icon-btn" data-action="edit-site" data-id="${esc(workSite.id)}" title="Edit">✎</button><button class="icon-btn delete" data-action="delete-site" data-id="${esc(workSite.id)}" title="Delete">×</button></div></td></tr>`;
       }).join("")}</tbody></table>`) : emptyState("No work sites added", "Create sites to assign workers and track where hours are worked.")}</section>`;
   }
   function renderPayroll() {
     const records = getRecords();
     const sums = statsForRecords(records);
-    const recordStart = new Date(`${currentWeek.toISOString().slice(0, 10)}T00:00:00`);
+    const recordStart = new Date(`${isoDate(currentWeek)}T00:00:00`);
     return `${heading("Weekly payroll", "Review weekly timesheets, deductions, and worker pay.", `${weekControl()}<button class="btn" data-action="batch-entry">▦ Batch entry</button><button class="btn btn-primary" data-action="new-payroll">＋ Add payroll</button>`)}
       <div class="stats-grid">${statCard("Net payroll", money(sums.pay), `${records.length} matching records`, "₱", "green")}${statCard("Cash advances", money(sums.cash), "For matching records", "↗", "orange")}${statCard("PCA deductions", money(sums.pca), "For matching records", "−", "blue")}${statCard("Allowances", money(sums.allowance), "For matching records", "＋", "")}</div>
       <section class="panel"><div class="filter-bar">
@@ -288,7 +321,7 @@
       ${summaryStrip(records)}
       <div class="panel-header"><div><h2>Payroll records</h2><p>Selected week: ${esc(weekLabel(recordStart))}</p></div><div class="heading-actions"><button class="btn btn-sm" data-action="print-selected">▤ Print selected</button><button class="btn btn-sm" data-action="print-all">Print all</button></div></div>
       ${tableCard(payrollTable(records, true))}
-      <div class="table-footer"><span>${records.length} payroll record${records.length === 1 ? "" : "s"}</span><span>Pay = total hours × effective rate + allowance − advances − deductions</span></div>
+      <div class="table-footer"><span>${records.length} payroll record${records.length === 1 ? "" : "s"}</span><span>Pay = (total hours ÷ 8) × daily rate + allowance − cash advance − PCA deduction</span></div>
       </section>
       <section class="panel"><div class="panel-header"><div><h2>Batch payroll entry</h2><p>Enter hours for several workers at one site and save all timesheets together.</p></div><button class="btn btn-primary btn-sm" data-action="batch-entry">Start batch entry</button></div></section>`;
   }
@@ -458,7 +491,7 @@
       ${field("Phone number", "phone", person ? person.phone : "", "tel")}
       ${field("Position (optional)", "positionId", "", "select", { selectOptions: positionOptions })}
       ${field("Work site (optional)", "siteId", "", "select", { selectOptions: siteOptions })}
-      ${field("Override rate (optional)", "overrideRate", person && person.overrideRate != null ? person.overrideRate : "", "number", { step: "0.01", min: "0", placeholder: "Uses position default when blank" })}
+      ${field("Override daily rate (optional)", "overrideRate", person && person.overrideRate != null ? person.overrideRate : "", "number", { step: "0.01", min: "0", placeholder: "Uses position default when blank" })}
       ${field("Opening PCA balance", "pcaBalance", person ? (person.initialPcaBalance != null ? person.initialPcaBalance : person.pcaBalance) : 0, "number", { step: "0.01", min: "0" })}
       ${field("Address", "address", person ? person.address : "", "textarea", { full: true })}
       ${field("Emergency contact", "emergencyContact", person ? person.emergencyContact : "", "text")}
@@ -521,68 +554,125 @@
     });
   }
   function defaultRecord(person, week) {
-    const record = {
+    return {
       id: id(), workerId: person.id, weekStart: week, effectiveRate: effectiveRate(person),
       allowanceAmount: 0, allowanceType: "", allowanceNote: "", cashAdvance: 0,
       newPcaAmount: 0, pcaReason: "", pcaDeduction: 0, resultingPcaBalance: number(person.pcaBalance),
       totalPay: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-      otherDate: "", otherHours: 0, otherSiteId: ""
+      days: []
     };
-    DAYS.forEach(day => { record[`${day.key}Hours`] = 0; record[`${day.key}SiteId`] = person.siteId || ""; });
-    return record;
   }
   function showPayrollForm(record) {
     const existing = Boolean(record);
     const person = record ? workerForRecord(record.workerId) : null;
-    const availableWorkers = activeWorkers().concat(person && person.deletedAt ? [person] : []);
+    const selectedWeek = record ? record.weekStart : isoDate(currentWeek);
+    const availableWorkers = existing
+      ? (person ? [person] : [])
+      : activeWorkers().filter(worker => !data.payroll.some(item => item.workerId === worker.id && item.weekStart === selectedWeek));
     const workerOptions = selectOptions(availableWorkers, record && record.workerId, "Choose worker", item => item.name);
     const siteSelect = selected => selectOptions(data.sites, selected, "No site", item => item.name);
-    const daysMarkup = DAYS.map(day => `<div class="day-card"><strong>${day.label}</strong><input class="form-control hour-input" type="number" step="0.25" min="0" name="${day.key}Hours" aria-label="${day.label} hours" placeholder="Hours" value="${esc(record ? record[`${day.key}Hours`] : 0)}"><select class="form-control" name="${day.key}SiteId" aria-label="${day.label} site">${siteSelect(record ? record[`${day.key}SiteId`] : "")}</select></div>`).join("");
+    const entryMarkup = entry => `<div class="timesheet-entry" data-entry-row>
+      <input type="hidden" name="entryId" value="${esc(entry.id)}">
+      <label>Work date<input class="form-control" type="date" name="entryDate" value="${esc(entry.workDate)}" required></label>
+      <label>Hours worked<input class="form-control" type="number" name="entryHours" min="0" step="0.25" value="${esc(entry.hours)}" required></label>
+      <label>Work site<select class="form-control" name="entrySite">${siteSelect(entry.siteId || "")}</select></label>
+      <button class="btn btn-sm" type="button" data-remove-entry>Remove</button>
+    </div>`;
     const body = `<div class="form-grid">
-      ${field("Worker", "workerId", "", "select", { required: true, selectOptions: workerOptions })}
-      ${field("Week starting Monday", "weekStart", record ? record.weekStart : isoDate(currentWeek), "date", { required: true })}
-      ${field("Effective rate per hour", "effectiveRate", record ? record.effectiveRate : "", "number", { required: true, step: "0.01", min: "0" })}
-      <div class="form-field"><label>Rate source</label><div id="rate-source" class="form-control" style="display:flex;align-items:center;background:#fafbfe">Select a worker</div></div>
-      <div class="section-label">Daily hours and work site</div><div class="form-field full"><div class="days-grid">${daysMarkup}</div></div>
-      <div class="section-label">Extra day</div>
-      ${field("Other date", "otherDate", record ? record.otherDate : "", "date")}
-      ${field("Other hours", "otherHours", record ? record.otherHours : 0, "number", { min: "0", step: "0.25" })}
-      ${field("Other day site", "otherSiteId", "", "select", { selectOptions: siteSelect(record ? record.otherSiteId : "") })}
+      ${existing
+        ? `<div class="form-field"><label>Worker</label><select class="form-control" name="workerId" disabled>${workerOptions}</select><input type="hidden" name="workerId" value="${esc(record.workerId)}"></div>`
+        : field("Worker", "workerId", "", "select", { required: true, selectOptions: workerOptions })}
+      ${field("Week starting Sunday", "weekStart", selectedWeek, "date", { required: true })}
+      <div class="form-field"><label>Effective daily rate</label><input id="effective-rate" class="form-control" type="number" name="effectiveRate" value="${esc(record ? record.effectiveRate : "")}" readonly required><small id="rate-source" class="rate-note">Select a worker</small></div>
+      <div class="section-label">Work entries</div>
+      <div class="form-field full"><div class="notice">Enter actual hours worked after subtracting lunch (for example, 8 AM–5 PM less a 1-hour lunch = 8 hours). Eight hours equals one payable day unit; four hours equals 0.5 units. Special or makeup dates can be outside the regular week.</div><div id="timesheet-entries" class="timesheet-entries">${(record && record.days || []).map(entryMarkup).join("")}</div><button class="btn btn-sm" type="button" id="add-timesheet-entry">＋ Add work entry</button></div>
       <div class="section-label">Allowance and deductions</div>
       ${field("Allowance amount", "allowanceAmount", record ? record.allowanceAmount : 0, "number", { min: "0", step: "0.01" })}
       ${field("Allowance type", "allowanceType", "", "select", { selectOptions: `<option value="">Choose type</option>${["Gas", "Load", "Others"].map(item => `<option value="${item}" ${record && record.allowanceType === item ? "selected" : ""}>${item}</option>`).join("")}` })}
-      ${field("Allowance note", "allowanceNote", record ? record.allowanceNote : "", "text")}
+      ${field("Allowance note", "allowanceNote", record ? record.allowanceNote : "", "text", { placeholder: "Required when an allowance is entered" })}
       ${field("Cash advance", "cashAdvance", record ? record.cashAdvance : 0, "number", { min: "0", step: "0.01" })}
       ${field("New PCA amount", "newPcaAmount", record ? record.newPcaAmount : 0, "number", { min: "0", step: "0.01" })}
       ${field("PCA deduction", "pcaDeduction", record ? record.pcaDeduction : 0, "number", { min: "0", step: "0.01" })}
-      ${field("PCA reason", "pcaReason", record ? record.pcaReason : "", "text", { full: true })}
-      <div class="form-field full"><div class="summary-strip" style="margin:0"><span>Hours<strong id="preview-hours">0</strong></span><span>Net pay<strong id="preview-pay">${money(record ? record.totalPay : 0)}</strong></span><span>Ending PCA balance<strong id="preview-pca">${money(record ? record.resultingPcaBalance : 0)}</strong></span></div></div>
+      ${field("PCA reason", "pcaReason", record ? record.pcaReason : "", "text", { full: true, placeholder: "Required when adding a PCA loan" })}
+      <div class="form-field full"><div class="summary-strip" style="margin:0"><span>Hours recorded<strong id="preview-hours">0</strong></span><span>Payable day units<strong id="preview-units">0</strong></span><span>Gross labor pay<strong id="preview-gross">${money(0)}</strong></span><span>Net pay<strong id="preview-pay">${money(record ? record.totalPay : 0)}</strong></span><span>Ending PCA balance<strong id="preview-pca">${money(record ? record.resultingPcaBalance : 0)}</strong></span></div></div>
     </div>`;
     openDialog(existing ? "Edit weekly payroll" : "New weekly payroll", "Record hours by day and site, then confirm allowances and deductions.", body, existing ? "Save payroll" : "Create payroll", form => savePayrollForm(record, form), true);
     const workerInput = dialog.querySelector('[name="workerId"]');
     const rateInput = dialog.querySelector('[name="effectiveRate"]');
     const source = dialog.querySelector("#rate-source");
+    const weekInput = dialog.querySelector('[name="weekStart"]');
+    const entries = dialog.querySelector("#timesheet-entries");
+    const addEntry = entry => {
+      entries.insertAdjacentHTML("beforeend", entryMarkup(entry));
+      updatePreview();
+    };
     const setRate = () => {
       const selected = workerForRecord(workerInput.value);
-      if (!selected) { source.textContent = "Select a worker"; return; }
+      if (!selected) {
+        source.textContent = "Select a worker";
+        if (!existing) rateInput.value = "";
+        return;
+      }
       if (!existing || workerInput.value !== record.workerId) {
         rateInput.value = effectiveRate(selected);
       }
       source.textContent = selected.overrideRate !== "" && selected.overrideRate != null ? "Worker override" : "Position default";
     };
+    const refreshWorkerOptions = () => {
+      if (existing) return;
+      const currentWorkerId = workerInput.value;
+      const eligibleWorkers = activeWorkers().filter(worker =>
+        !data.payroll.some(item => item.workerId === worker.id && item.weekStart === weekInput.value)
+      );
+      const selection = eligibleWorkers.some(worker => worker.id === currentWorkerId) ? currentWorkerId : "";
+      workerInput.innerHTML = selectOptions(eligibleWorkers, selection, "Choose worker", item => item.name);
+      setRate();
+    };
     const updatePreview = () => {
       const values = new FormData(dialog.querySelector("#dialog-form"));
-      const hourTotal = DAYS.reduce((sum, day) => sum + number(values.get(`${day.key}Hours`)), 0) + number(values.get("otherHours"));
+      const hourTotal = values.getAll("entryHours").reduce((sum, hours) => sum + number(hours), 0);
+      const dayUnits = hourTotal / HOURS_PER_DAY;
       const rate = number(values.get("effectiveRate"));
-      const balance = (number(person && person.pcaBalance) || 0) + number(values.get("newPcaAmount")) - number(values.get("pcaDeduction"));
-      const pay = hourTotal * rate + number(values.get("allowanceAmount")) - number(values.get("cashAdvance")) - number(values.get("pcaDeduction"));
+      const selectedWorker = workerForRecord(workerInput.value);
+      const balance = projectedPcaBalance(
+        selectedWorker,
+        record,
+        weekInput.value,
+        number(values.get("newPcaAmount")),
+        number(values.get("pcaDeduction"))
+      );
+      const gross = dayUnits * rate;
+      const pay = gross + number(values.get("allowanceAmount")) - number(values.get("cashAdvance")) - number(values.get("pcaDeduction"));
       dialog.querySelector("#preview-hours").textContent = hourTotal.toFixed(2);
-      dialog.querySelector("#preview-pay").textContent = money(pay);
+      dialog.querySelector("#preview-units").textContent = dayUnits.toFixed(2);
+      dialog.querySelector("#preview-gross").textContent = money(gross);
+      dialog.querySelector("#preview-pay").textContent = money(Math.round(pay * 100) / 100);
       dialog.querySelector("#preview-pca").textContent = money(balance);
     };
+    dialog.querySelector("#add-timesheet-entry").addEventListener("click", () => {
+      const selected = workerForRecord(workerInput.value);
+      addEntry({
+        id: id(),
+        workDate: weekInput.value || isoDate(currentWeek),
+        hours: "",
+        siteId: selected ? selected.siteId || "" : ""
+      });
+    });
+    entries.addEventListener("click", event => {
+      const button = event.target.closest("[data-remove-entry]");
+      if (!button) return;
+      button.closest("[data-entry-row]").remove();
+      updatePreview();
+    });
     workerInput.addEventListener("change", () => { setRate(); updatePreview(); });
-    dialog.querySelectorAll("input,select").forEach(input => input.addEventListener("input", updatePreview));
-    dialog.querySelectorAll("select").forEach(input => input.addEventListener("change", updatePreview));
+    weekInput.addEventListener("change", () => {
+      if (!weekInput.value) return;
+      weekInput.value = isoDate(weekStart(new Date(`${weekInput.value}T00:00:00`)));
+      refreshWorkerOptions();
+      updatePreview();
+    });
+    dialog.querySelector("#dialog-form").addEventListener("input", updatePreview);
+    dialog.querySelector("#dialog-form").addEventListener("change", updatePreview);
     setRate();
     updatePreview();
   }
@@ -592,27 +682,58 @@
     const startValue = String(form.get("weekStart") || "");
     if (!person || !startValue) { notify("Choose a worker and a week."); return false; }
     const week = isoDate(weekStart(new Date(`${startValue}T00:00:00`)));
+    const duplicate = data.payroll.find(item => item.workerId === workerId && item.weekStart === week && item.id !== (existingRecord && existingRecord.id));
+    if (duplicate) { notify("This worker already has a payroll record for that week. Edit the existing record instead."); return false; }
+    const entryIds = form.getAll("entryId");
+    const entryDates = form.getAll("entryDate");
+    const entryHours = form.getAll("entryHours");
+    const entrySites = form.getAll("entrySite");
+    const days = [];
+    for (let index = 0; index < entryIds.length; index++) {
+      const workDate = String(entryDates[index] || "");
+      const hoursValue = String(entryHours[index] || "");
+      const siteId = String(entrySites[index] || "");
+      if (!workDate && !hoursValue && !siteId) continue;
+      const parsedDate = new Date(`${workDate}T00:00:00`);
+      if (!workDate || Number.isNaN(parsedDate.getTime()) || isoDate(parsedDate) !== workDate || hoursValue === "" || number(hoursValue) < 0) {
+        notify("Enter a valid work date and non-negative hours for every work entry.");
+        return false;
+      }
+      if (siteId && !site(siteId)) { notify("Choose a valid work site or leave it blank."); return false; }
+      days.push({ id: String(entryIds[index] || id()), workDate, hours: number(hoursValue), siteId });
+    }
+    const allowanceAmount = number(form.get("allowanceAmount"));
+    const allowanceType = String(form.get("allowanceType") || "");
+    const allowanceNote = String(form.get("allowanceNote") || "").trim();
+    const newPcaAmount = number(form.get("newPcaAmount"));
+    const pcaReason = String(form.get("pcaReason") || "").trim();
+    const unchangedLegacyAllowance = existingRecord
+      && allowanceAmount === number(existingRecord.allowanceAmount)
+      && allowanceType === String(existingRecord.allowanceType || "")
+      && allowanceNote === String(existingRecord.allowanceNote || "");
+    if (allowanceAmount > 0 && (!allowanceType || !allowanceNote) && !unchangedLegacyAllowance) {
+      notify("Choose an allowance type and enter a descriptive note.");
+      return false;
+    }
+    const unchangedLegacyPca = existingRecord
+      && newPcaAmount === number(existingRecord.newPcaAmount)
+      && pcaReason === String(existingRecord.pcaReason || "");
+    if (newPcaAmount > 0 && !pcaReason && !unchangedLegacyPca) {
+      notify("Enter a reason for the new PCA loan.");
+      return false;
+    }
     const values = {
       workerId, weekStart: week, effectiveRate: number(form.get("effectiveRate")),
-      allowanceAmount: number(form.get("allowanceAmount")), allowanceType: String(form.get("allowanceType") || ""),
-      allowanceNote: String(form.get("allowanceNote") || "").trim(), cashAdvance: number(form.get("cashAdvance")),
-      newPcaAmount: number(form.get("newPcaAmount")), pcaReason: String(form.get("pcaReason") || "").trim(),
-      pcaDeduction: number(form.get("pcaDeduction")), otherDate: String(form.get("otherDate") || ""),
-      otherHours: number(form.get("otherHours")), otherSiteId: String(form.get("otherSiteId") || "")
+      allowanceAmount, allowanceType,
+      allowanceNote, cashAdvance: number(form.get("cashAdvance")),
+      newPcaAmount, pcaReason,
+      pcaDeduction: number(form.get("pcaDeduction")), days
     };
-    DAYS.forEach(day => {
-      values[`${day.key}Hours`] = number(form.get(`${day.key}Hours`));
-      values[`${day.key}SiteId`] = String(form.get(`${day.key}SiteId`) || "");
-    });
     values.resultingPcaBalance = 0;
     values.totalPay = calcTotal(values);
     values.updatedAt = new Date().toISOString();
     if (existingRecord) Object.assign(existingRecord, values);
-    else {
-      const duplicate = data.payroll.find(item => item.workerId === workerId && item.weekStart === week);
-      if (duplicate) Object.assign(duplicate, values);
-      else data.payroll.push({ ...defaultRecord(person, week), ...values });
-    }
+    else data.payroll.push({ ...defaultRecord(person, week), ...values });
     recalculatePca(person);
     currentWeek = new Date(`${week}T00:00:00`);
     persistAndRender(existingRecord ? "Payroll updated." : "Payroll saved.");
@@ -623,8 +744,8 @@
     const batchDrafts = new Map();
     const body = `<div class="batch-grid"><div class="batch-options">
       ${field("Work site", "batchSite", "", "select", { required: true, selectOptions: selectOptions(data.sites, "", "Choose site", item => item.name) })}
-      ${field("Week starting Monday", "batchWeek", isoDate(currentWeek), "date", { required: true })}
-      <div class="notice">Enter hours only for days worked at this site. Blank days are left unchanged, so you can enter the same worker at another site without overwriting other days.</div>
+      ${field("Week starting Sunday", "batchWeek", isoDate(currentWeek), "date", { required: true })}
+      <div class="notice">Enter attendance hours for each worker and day at this site. Eight hours equals one payable day unit. Blank days are unchanged; different sites can be entered on the same date. Enter allowances and separate shifts in the individual timesheet.</div>
       <button class="btn btn-primary" type="button" id="batch-save">Save batch payroll</button>
     </div><div class="batch-work-area">
       <div class="batch-toolbar"><div class="search-wrap"><input id="batch-search" class="search-control" placeholder="Find worker by name"></div><label class="batch-toggle"><input id="batch-show-all" type="checkbox"> Show all active workers</label><span id="batch-result-count" class="muted"></span></div>
@@ -659,11 +780,13 @@
         const record = data.payroll.find(item => item.workerId === person.id && item.weekStart === week);
         const days = {};
         DAYS.forEach(day => {
-          const hoursKey = `${day.key}Hours`;
-          const siteKey = `${day.key}SiteId`;
-          days[day.key] = record && record[siteKey] === siteId ? String(record[hoursKey]) : "";
+          const date = weekdayDate(week, day);
+          const matchingEntries = (record && record.days || []).filter(entry => entry.workDate === date && entry.siteId === siteId);
+          days[day.key] = matchingEntries.length
+            ? String(matchingEntries.reduce((sum, entry) => sum + number(entry.hours), 0))
+            : "";
         });
-        batchDrafts.set(key, { days, allowance: "" });
+        batchDrafts.set(key, { days });
       }
       return batchDrafts.get(key);
     }
@@ -680,7 +803,6 @@
         DAYS.forEach(day => {
           draft.days[day.key] = row.querySelector(`[data-day="${day.key}"]`).value;
         });
-        draft.allowance = row.querySelector("[data-allowance]").value;
       });
     }
 
@@ -700,7 +822,7 @@
       }
       const matches = activeWorkers().filter(person => {
         const record = data.payroll.find(item => item.workerId === person.id && item.weekStart === week);
-        const hasHoursAtSite = record && DAYS.some(day => record[`${day.key}SiteId`] === context.siteId && number(record[`${day.key}Hours`]) > 0);
+        const hasHoursAtSite = record && (record.days || []).some(entry => entry.siteId === context.siteId && number(entry.hours) > 0);
         const belongsAtSite = person.siteId === context.siteId || hasHoursAtSite;
         return (context.showAll || belongsAtSite) && (!context.search || person.name.toLowerCase().includes(context.search));
       }).sort((a, b) => a.name.localeCompare(b.name));
@@ -711,14 +833,18 @@
       if (!matches.length) {
         list.innerHTML = emptyState("No workers found for this site", context.showAll ? "Try another search." : "Try searching by name or include all active workers.");
       } else {
-        const header = `<div class="batch-worker-row header"><span>Worker</span>${DAYS.map(day => `<span>${day.short}</span>`).join("")}<span>Allowance</span></div>`;
+        const header = `<div class="batch-worker-row header"><span>Worker</span>${DAYS.map(day => {
+          const workDate = weekdayDate(week, day);
+          const date = new Date(`${workDate}T12:00:00`);
+          const shortDate = date.toLocaleDateString("en-PH", { month: "short", day: "numeric" });
+          return `<span class="batch-day-heading" title="${esc(fmtDate(workDate))}">${day.short}<small>${esc(shortDate)}</small></span>`;
+        }).join("")}</div>`;
         const rows = pageWorkers.map(person => {
           const draft = getBatchDraft(person, context.siteId, week);
           const title = (position(person.positionId) || {}).title || "No position";
           return `<div class="batch-worker-row" data-worker-id="${esc(person.id)}">
             <div class="worker-cell">${workerAvatar(person)}<span><strong>${esc(person.name)}</strong><small>${esc(title)}</small></span></div>
             ${DAYS.map(day => `<input type="number" min="0" step="0.25" value="${esc(draft.days[day.key])}" placeholder="—" data-day="${day.key}" aria-label="${day.short} hours for ${esc(person.name)}">`).join("")}
-            <input type="number" min="0" step="0.01" value="${esc(draft.allowance)}" placeholder="—" data-allowance aria-label="Allowance for ${esc(person.name)}">
           </div>`;
         }).join("");
         list.innerHTML = `${header}${rows}`;
@@ -754,7 +880,6 @@
       const week = currentBatchWeek(context.weekDate);
       const draft = getBatchDraft(worker(row.dataset.workerId), context.siteId, week);
       if (input.dataset.day) draft.days[input.dataset.day] = input.value;
-      if (input.hasAttribute("data-allowance")) draft.allowance = input.value;
     });
     dialog.querySelector("#batch-pagination").addEventListener("click", event => {
       const button = event.target.closest("[data-batch-page]");
@@ -778,43 +903,28 @@
       if (person) allWorkerDrafts.set(person.id, { person, draft });
     });
 
-    const conflicts = [];
-    allWorkerDrafts.forEach(({ person, draft }) => {
-      const record = data.payroll.find(item => item.workerId === person.id && item.weekStart === week);
-      DAYS.forEach(day => {
-        const value = draft.days[day.key];
-        if (value !== "" && record && record[`${day.key}SiteId`] && record[`${day.key}SiteId`] !== siteId && number(record[`${day.key}Hours`]) > 0) {
-          conflicts.push(`${person.name} — ${day.label}`);
-        }
-      });
-    });
-    if (conflicts.length) {
-      notify(`A worker can have one site per day. Clear these hours at their current site first: ${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? ` and ${conflicts.length - 3} more` : ""}.`);
-      return false;
-    }
-
     let saved = 0;
     let skipped = 0;
     allWorkerDrafts.forEach(({ person, draft }) => {
-      const hasEntry = DAYS.some(day => draft.days[day.key] !== "") || draft.allowance !== "";
+      const hasEntry = DAYS.some(day => draft.days[day.key] !== "");
       if (!hasEntry) { skipped++; return; }
       let record = data.payroll.find(item => item.workerId === person.id && item.weekStart === week);
       if (!record) {
         record = defaultRecord(person, week);
-        DAYS.forEach(day => { record[`${day.key}SiteId`] = ""; });
         data.payroll.push(record);
       }
       DAYS.forEach(day => {
         const value = draft.days[day.key];
         if (value === "") return;
         const hours = number(value);
-        record[`${day.key}Hours`] = hours;
-        record[`${day.key}SiteId`] = hours > 0 ? siteId : "";
+        const date = weekdayDate(week, day);
+        record.days = (record.days || []).filter(entry => !(entry.workDate === date && entry.siteId === siteId));
+        if (hours > 0) record.days.push({ id: id(), workDate: date, hours, siteId });
       });
-      if (draft.allowance !== "") record.allowanceAmount = number(draft.allowance);
       record.updatedAt = new Date().toISOString();
       record.resultingPcaBalance = number(person.pcaBalance);
       record.totalPay = calcTotal(record);
+      recalculatePca(person);
       saved++;
     });
     currentWeek = new Date(`${week}T00:00:00`);
@@ -831,9 +941,9 @@
   function workerHistory(person) {
     const records = data.payroll.filter(record => record.workerId === person.id).sort((a, b) => b.weekStart.localeCompare(a.weekStart));
     const body = `<div class="panel-header"><div><h2>${esc(person.name)}</h2><p>${esc((position(person.positionId) || {}).title || "Position not set")} · ${esc((site(person.siteId) || {}).name || "No site")}</p></div></div>
-      ${records.length ? `<div class="table-wrap"><table><thead><tr><th>Week</th><th>Hours</th><th>Allowance</th><th>Cash advance</th><th>PCA deduction</th><th>Net pay</th><th></th></tr></thead><tbody>${records.map(record => {
-        const hours = DAYS.reduce((sum, day) => sum + number(record[`${day.key}Hours`]), 0) + number(record.otherHours);
-        return `<tr><td>${esc(weekLabel(new Date(`${record.weekStart}T00:00:00`)))}</td><td>${hours.toFixed(2)}</td><td>${money(record.allowanceAmount)}</td><td>${money(record.cashAdvance)}</td><td>${money(record.pcaDeduction)}</td><td class="pay-value">${money(record.totalPay)}</td><td><button class="icon-btn" data-action="edit-payroll" data-id="${esc(record.id)}">✎</button></td></tr>`;
+      ${records.length ? `<div class="table-wrap"><table><thead><tr><th>Week</th><th>Hours</th><th>Day units</th><th>Allowance</th><th>Cash advance</th><th>PCA deduction</th><th>Net pay</th><th></th></tr></thead><tbody>${records.map(record => {
+        const hours = recordHours(record);
+        return `<tr><td>${esc(weekLabel(new Date(`${record.weekStart}T00:00:00`)))}</td><td>${hours.toFixed(2)}</td><td>${recordUnits(record).toFixed(2)}</td><td>${money(record.allowanceAmount)}</td><td>${money(record.cashAdvance)}</td><td>${money(record.pcaDeduction)}</td><td class="pay-value">${money(record.totalPay)}</td><td><button class="icon-btn" data-action="edit-payroll" data-id="${esc(record.id)}">✎</button></td></tr>`;
       }).join("")}</tbody></table></div>` : emptyState("No payroll history", "Payroll records for this worker will appear here.")}`;
     openDialog("Worker pay history", "Previous weekly timesheets and pay records.", body, "Close", () => true, true);
     dialog.querySelector(".form-actions").innerHTML = `<button type="button" class="btn btn-primary" data-dialog-cancel>Close</button>`;
@@ -844,15 +954,18 @@
     const html = records.map(record => {
       const person = workerForRecord(record.workerId);
       const job = position(person && person.positionId);
-      const daysRows = DAYS.map(day => {
-        const workSite = site(record[`${day.key}SiteId`]);
-        return `<tr><td>${day.label}</td><td>${number(record[`${day.key}Hours`]).toFixed(2)}</td><td>${esc(workSite ? workSite.name : "—")}</td></tr>`;
-      }).join("") + (number(record.otherHours) ? `<tr><td>${esc(record.otherDate || "Other day")}</td><td>${number(record.otherHours).toFixed(2)}</td><td>${esc((site(record.otherSiteId) || {}).name || "—")}</td></tr>` : "");
-      const totalHours = DAYS.reduce((sum, day) => sum + number(record[`${day.key}Hours`]), 0) + number(record.otherHours);
+      const daysRows = (record.days || []).slice().sort((a, b) => a.workDate.localeCompare(b.workDate)).map(entry => {
+        const workSite = site(entry.siteId);
+        const units = number(entry.hours) / HOURS_PER_DAY;
+        return `<tr><td>${esc(fmtDate(entry.workDate))}</td><td>${number(entry.hours).toFixed(2)}</td><td>${units.toFixed(2)}</td><td>${esc(workSite ? workSite.name : "—")}</td><td>${money(units * number(record.effectiveRate))}</td></tr>`;
+      }).join("");
+      const totalHours = recordHours(record);
+      const totalUnits = recordUnits(record);
+      const grossPay = totalUnits * number(record.effectiveRate);
       return `<article class="slip"><header><div><h1>AMR Payroll</h1><p>Worker payslip</p></div><strong>${esc(weekLabel(new Date(`${record.weekStart}T00:00:00`)))}</strong></header>
-        <section class="identity"><div><small>WORKER</small><strong>${esc(person ? person.name : "Removed worker")}</strong></div><div><small>POSITION</small><strong>${esc(job ? job.title : "—")}</strong></div><div><small>RATE / HOUR</small><strong>${money(record.effectiveRate)}</strong></div></section>
-        <table><thead><tr><th>Day</th><th>Hours</th><th>Site</th></tr></thead><tbody>${daysRows}<tr><th>Total hours</th><th>${totalHours.toFixed(2)}</th><th></th></tr></tbody></table>
-        <section class="pay-summary"><div><span>Gross pay (${totalHours.toFixed(2)} hours × ${money(record.effectiveRate)})</span><strong>${money(totalHours * number(record.effectiveRate))}</strong></div><div><span>Allowance${record.allowanceType ? ` · ${esc(record.allowanceType)}` : ""}${record.allowanceNote ? ` · ${esc(record.allowanceNote)}` : ""}</span><strong>+ ${money(record.allowanceAmount)}</strong></div><div><span>Cash advance</span><strong>− ${money(record.cashAdvance)}</strong></div><div><span>PCA deduction${record.pcaReason ? ` · ${esc(record.pcaReason)}` : ""}</span><strong>− ${money(record.pcaDeduction)}</strong></div><div class="net"><span>Net pay</span><strong>${money(record.totalPay)}</strong></div><div><span>Ending PCA balance</span><strong>${money(record.resultingPcaBalance)}</strong></div></section>
+        <section class="identity"><div><small>WORKER</small><strong>${esc(person ? person.name : "Removed worker")}</strong></div><div><small>POSITION</small><strong>${esc(job ? job.title : "—")}</strong></div><div><small>DAILY RATE</small><strong>${money(record.effectiveRate)}</strong></div></section>
+        <table><thead><tr><th>Work date</th><th>Hours</th><th>Day units</th><th>Site</th><th>Labor cost</th></tr></thead><tbody>${daysRows}<tr><th>Total</th><th>${totalHours.toFixed(2)}</th><th>${totalUnits.toFixed(2)}</th><th></th><th>${money(grossPay)}</th></tr></tbody></table>
+        <section class="pay-summary"><div><span>Gross labor pay (${totalHours.toFixed(2)} hours ÷ 8 × ${money(record.effectiveRate)} daily rate)</span><strong>${money(grossPay)}</strong></div><div><span>Allowance${record.allowanceType ? ` · ${esc(record.allowanceType)}` : ""}${record.allowanceNote ? ` · ${esc(record.allowanceNote)}` : ""}</span><strong>+ ${money(record.allowanceAmount)}</strong></div><div><span>Cash advance</span><strong>− ${money(record.cashAdvance)}</strong></div><div><span>PCA deduction${record.pcaReason ? ` · ${esc(record.pcaReason)}` : ""}</span><strong>− ${money(record.pcaDeduction)}</strong></div><div class="net"><span>Net pay</span><strong>${money(record.totalPay)}</strong></div><div><span>Ending PCA balance</span><strong>${money(record.resultingPcaBalance)}</strong></div></section>
         <footer><span>Worker signature: _______________________</span><span>Received on: ______________</span></footer></article>`;
     }).join("");
     const printWindow = window.open("", "_blank");
@@ -889,7 +1002,7 @@
     if (action === "delete-site") {
       const workSite = site(button.dataset.id);
       if (data.workers.some(item => item.siteId === button.dataset.id)) { notify("This site is assigned to workers and cannot be deleted."); return; }
-      if (data.payroll.some(item => DAYS.some(day => item[`${day.key}SiteId`] === button.dataset.id) || item.otherSiteId === button.dataset.id)) { notify("This site is used in payroll history and cannot be deleted."); return; }
+      if (data.payroll.some(item => (item.days || []).some(entry => entry.siteId === button.dataset.id))) { notify("This site is used in payroll history and cannot be deleted."); return; }
       if (workSite && window.confirm(`Delete the ${workSite.name} site?`)) { data.sites = data.sites.filter(item => item.id !== workSite.id); persistAndRender("Work site deleted."); }
       return;
     }

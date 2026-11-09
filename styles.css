@@ -137,9 +137,11 @@ tbody tr:hover { background: #fcfcff; }
 .form-control { width: 100%; border: 1px solid #e3e8ef; border-radius: 6px; height: 35px; padding: 0 10px; color: #46536b; background: #fff; font-size: 10px; outline: none; }
 textarea.form-control { height: 72px; padding: 9px 10px; resize: vertical; }
 .batch-workers { border: 1px solid #edf0f5; border-radius: 7px; max-height: 430px; overflow: auto; }
-.batch-worker-row { display: grid; grid-template-columns: minmax(150px,1fr) repeat(7,57px) 72px; gap: 7px; align-items: center; padding: 9px 11px; border-bottom: 1px solid #eff1f5; }
+.batch-worker-row { display: grid; grid-template-columns: minmax(150px,1fr) repeat(7,57px); gap: 7px; align-items: center; padding: 9px 11px; border-bottom: 1px solid #eff1f5; }
 .batch-worker-row:last-child { border-bottom: 0; }
 .batch-worker-row.header { position: sticky; top: 0; z-index: 1; background: #fafbfe; color: #939db0; font-size: 8px; font-weight: 700; }
+.batch-day-heading { text-align: center; line-height: 1.35; white-space: nowrap; }
+.batch-day-heading small { display: block; color: #64718a; font-size: 8px; font-weight: 600; }
 .batch-worker-row .worker-cell { min-width: 0; }
 .batch-worker-row input { width: 100%; height: 29px; padding: 0 5px; text-align: center; border: 1px solid #e5e9f0; border-radius: 5px; font-size: 9px; color: #46536b; }
 .batch-worker-row input::placeholder { color: #b2bac7; }
@@ -156,10 +158,10 @@ textarea.form-control { height: 72px; padding: 9px 10px; resize: vertical; }
 .form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
 .form-field.full { grid-column: 1/-1; }
 .form-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 16px; margin-top: 17px; border-top: 1px solid var(--line); }
-.days-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }
-.day-card { border: 1px solid #eaedf3; border-radius: 7px; padding: 9px; background: #fcfcfe; }
-.day-card strong { display: block; font-size: 9px; margin-bottom: 7px; color: #58657b; }
-.day-card .form-control { height: 31px; margin-top: 5px; }
+.timesheet-entries { display: grid; gap: 8px; margin-bottom: 10px; }
+.timesheet-entry { display: grid; grid-template-columns: minmax(145px,1fr) minmax(95px,.7fr) minmax(145px,1fr) auto; gap: 9px; align-items: end; padding: 10px; border: 1px solid #eaedf3; border-radius: 7px; background: #fcfcfe; }
+.timesheet-entry label { min-width: 0; }
+.timesheet-entry .form-control { height: 33px; }
 .section-label { grid-column: 1/-1; font-size: 10px; color: #6758c9; font-weight: 700; border-bottom: 1px solid #eeecfb; padding: 2px 0 7px; margin-top: 3px; }
 .file-input { font-size: 9px; }
 .toast { position: fixed; right: 22px; bottom: 22px; background: #202b42; color: #fff; border-radius: 7px; padding: 11px 15px; font-size: 10px; box-shadow: 0 8px 20px #11182733; opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; z-index: 10; }
@@ -198,7 +200,7 @@ textarea.form-control { height: 72px; padding: 9px 10px; resize: vertical; }
   .stat-card .stat-value { font-size: 18px; }
   .stat-icon { top: 11px; right: 11px; }
   .panel { padding: 13px; }
-  .days-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .timesheet-entry { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .form-grid { grid-template-columns: 1fr; }
   .form-field.full,.section-label { grid-column: auto; }
 }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 require_once __DIR__ . '/config.php';
 start_app_session();
 
+const HOURS_PER_PAYABLE_DAY = 8;
+
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 
@@ -52,6 +54,26 @@ function decimal_value(mixed $value, string $label): float
         respond(['error' => $label . ' must be a non-negative number.'], 400);
     }
     return (float)$value;
+}
+
+function valid_iso_date(mixed $value): bool
+{
+    if (!is_string($value)) {
+        return false;
+    }
+
+    $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+    return $date !== false && $date->format('Y-m-d') === $value;
+}
+
+function valid_sunday_week_start(mixed $value): bool
+{
+    if (!valid_iso_date($value)) {
+        return false;
+    }
+
+    $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+    return $date !== false && $date->format('w') === '0';
 }
 
 function require_authenticated_user(bool $checkCsrf): void
@@ -113,9 +135,41 @@ function save_data(PDO $pdo, array $payload): array
     $siteIds = id_list($payload['sites'], 'sites');
     $workerIds = id_list($payload['workers'], 'workers');
     $payrollIds = id_list($payload['payroll'], 'payroll');
+    $dayRows = [];
+    foreach ($payload['payroll'] as &$record) {
+        if (!isset($record['days']) || !is_array($record['days'])) {
+            respond(['error' => 'Every payroll record must include a days collection.'], 400);
+        }
+        $weekStart = (string)($record['weekStart'] ?? '');
+        if (!valid_sunday_week_start($weekStart)) {
+            respond(['error' => 'Each timesheet week must start on a valid Sunday.'], 400);
+        }
+        $normalizedDays = [];
+        foreach ($record['days'] as $day) {
+            if (!is_array($day) || !isset($day['id']) || !is_string($day['id']) || $day['id'] === '') {
+                respond(['error' => 'Every timesheet day must have a valid ID.'], 400);
+            }
+            if (!valid_iso_date($day['workDate'] ?? null)) {
+                respond(['error' => 'Each timesheet day must have a valid work date.'], 400);
+            }
+            $normalizedDay = [
+                'id' => $day['id'],
+                'timesheetId' => $record['id'],
+                'workDate' => $day['workDate'],
+                'hours' => decimal_value($day['hours'] ?? null, 'Hours'),
+                'siteId' => nullable_id($day['siteId'] ?? null),
+            ];
+            $normalizedDays[] = $normalizedDay;
+            $dayRows[] = $normalizedDay;
+        }
+        $record['days'] = $normalizedDays;
+    }
+    unset($record);
+    id_list($dayRows, 'timesheet day');
 
     $pdo->beginTransaction();
     try {
+        $positionRates = [];
         $positionQuery = $pdo->prepare(
             'INSERT INTO positions (id, title, daily_rate) VALUES (?, ?, ?)
              ON DUPLICATE KEY UPDATE title = VALUES(title), daily_rate = VALUES(daily_rate)'
@@ -125,7 +179,9 @@ function save_data(PDO $pdo, array $payload): array
             if ($title === '') {
                 respond(['error' => 'Position title is required.'], 400);
             }
-            $positionQuery->execute([$row['id'], $title, decimal_value($row['dailyRate'] ?? null, 'Daily rate')]);
+            $dailyRate = decimal_value($row['dailyRate'] ?? null, 'Daily rate');
+            $positionRates[$row['id']] = $dailyRate;
+            $positionQuery->execute([$row['id'], $title, $dailyRate]);
         }
 
         $siteQuery = $pdo->prepare(
@@ -153,6 +209,7 @@ function save_data(PDO $pdo, array $payload): array
               removal_reason = VALUES(removal_reason), deleted_at = VALUES(deleted_at)'
         );
         $photoPaths = [];
+        $workerRateInputs = [];
         foreach ($payload['workers'] as $row) {
             $name = trim((string)($row['name'] ?? ''));
             if ($name === '') {
@@ -160,9 +217,11 @@ function save_data(PDO $pdo, array $payload): array
             }
             $deletedAt = !empty($row['deletedAt']) ? date('Y-m-d H:i:s', strtotime((string)$row['deletedAt'])) : null;
             $overrideRate = ($row['overrideRate'] ?? '') === '' ? null : decimal_value($row['overrideRate'], 'Override rate');
+            $positionId = nullable_id($row['positionId'] ?? null);
+            $workerRateInputs[$row['id']] = ['positionId' => $positionId, 'overrideRate' => $overrideRate];
             $photoPath = normalize_photo($row['photo'] ?? '');
             $workerQuery->execute([
-                $row['id'], $name, nullable_id($row['positionId'] ?? null), nullable_id($row['siteId'] ?? null),
+                $row['id'], $name, $positionId, nullable_id($row['siteId'] ?? null),
                 $overrideRate, decimal_value($row['pcaBalance'] ?? 0, 'PCA balance'),
                 decimal_value($row['initialPcaBalance'] ?? $row['pcaBalance'] ?? 0, 'Initial PCA balance'),
                 trim((string)($row['phone'] ?? '')), trim((string)($row['address'] ?? '')),
@@ -175,11 +234,8 @@ function save_data(PDO $pdo, array $payload): array
         }
 
         $timesheetColumns = [
-            'id', 'worker_id', 'week_start',
-            'sunday_hours', 'monday_hours', 'tuesday_hours', 'wednesday_hours', 'thursday_hours', 'friday_hours', 'saturday_hours',
-            'sunday_site_id', 'monday_site_id', 'tuesday_site_id', 'wednesday_site_id', 'thursday_site_id', 'friday_site_id', 'saturday_site_id',
-            'other_date', 'other_hours', 'other_site_id', 'effective_rate', 'allowance_amount', 'allowance_type', 'allowance_note',
-            'cash_advance', 'new_pca_amount', 'pca_reason', 'pca_deduction', 'resulting_pca_balance', 'total_pay'
+            'id', 'worker_id', 'week_start', 'effective_rate', 'allowance_amount', 'allowance_type', 'allowance_note',
+            'cash_advance', 'new_pca_amount', 'pca_reason', 'pca_deduction', 'resulting_pca_balance'
         ];
         $insertColumns = implode(', ', $timesheetColumns);
         $placeholders = implode(', ', array_fill(0, count($timesheetColumns), '?'));
@@ -191,34 +247,85 @@ function save_data(PDO $pdo, array $payload): array
             "INSERT INTO weekly_timesheets ($insertColumns) VALUES ($placeholders)
              ON DUPLICATE KEY UPDATE $updates"
         );
+        $existingTimesheetQuery = $pdo->prepare(
+            'SELECT worker_id, effective_rate, allowance_amount, allowance_type, allowance_note,
+                    new_pca_amount, pca_reason
+             FROM weekly_timesheets WHERE id = ?'
+        );
+        $workerWeekQuery = $pdo->prepare(
+            'SELECT id FROM weekly_timesheets WHERE worker_id = ? AND week_start = ?'
+        );
+        $deleteDaysQuery = $pdo->prepare('DELETE FROM timesheet_days WHERE timesheet_id = ?');
+        $dayQuery = $pdo->prepare(
+            'INSERT INTO timesheet_days (id, timesheet_id, work_date, hours, site_id) VALUES (?, ?, ?, ?, ?)'
+        );
         foreach ($payload['payroll'] as $row) {
             $weekStart = (string)($row['weekStart'] ?? '');
-            $date = DateTimeImmutable::createFromFormat('!Y-m-d', $weekStart);
-            if (!$date || $date->format('Y-m-d') !== $weekStart || (int)$date->format('N') !== 1) {
-                respond(['error' => 'Each timesheet week must start on a valid Monday.'], 400);
+            $workerId = (string)($row['workerId'] ?? '');
+            $existingTimesheetQuery->execute([$row['id']]);
+            $existingTimesheet = $existingTimesheetQuery->fetch();
+            if ($existingTimesheet && $existingTimesheet['worker_id'] !== $workerId) {
+                respond(['error' => 'A payroll record cannot be reassigned to another worker.'], 400);
             }
-            $values = [$row['id'], (string)($row['workerId'] ?? ''), $weekStart];
-            foreach (['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as $day) {
-                $values[] = decimal_value($row[$day . 'Hours'] ?? 0, ucfirst($day) . ' hours');
+            $workerWeekQuery->execute([$workerId, $weekStart]);
+            $workerWeek = $workerWeekQuery->fetch();
+            if ($workerWeek && $workerWeek['id'] !== $row['id']) {
+                respond(['error' => 'This worker already has a payroll record for that week.'], 409);
             }
-            foreach (['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as $day) {
-                $values[] = nullable_id($row[$day . 'SiteId'] ?? null);
+            if ($existingTimesheet) {
+                $effectiveRate = (float)$existingTimesheet['effective_rate'];
+            } else {
+                $workerRate = $workerRateInputs[$workerId] ?? null;
+                if ($workerRate === null) {
+                    respond(['error' => 'Each payroll record must reference a submitted worker.'], 400);
+                }
+                $effectiveRate = $workerRate['overrideRate'];
+                if ($effectiveRate === null) {
+                    $effectiveRate = $positionRates[$workerRate['positionId']] ?? 0.0;
+                }
             }
-            $values[] = !empty($row['otherDate']) ? (string)$row['otherDate'] : null;
-            $values[] = decimal_value($row['otherHours'] ?? 0, 'Other hours');
-            $values[] = nullable_id($row['otherSiteId'] ?? null);
-            $values[] = decimal_value($row['effectiveRate'] ?? 0, 'Effective rate');
-            $values[] = decimal_value($row['allowanceAmount'] ?? 0, 'Allowance');
+            $allowanceAmount = decimal_value($row['allowanceAmount'] ?? 0, 'Allowance');
+            $cashAdvance = decimal_value($row['cashAdvance'] ?? 0, 'Cash advance');
+            $newPcaAmount = decimal_value($row['newPcaAmount'] ?? 0, 'New PCA amount');
+            $pcaDeduction = decimal_value($row['pcaDeduction'] ?? 0, 'PCA deduction');
+            $resultingPcaBalance = decimal_value($row['resultingPcaBalance'] ?? 0, 'Resulting PCA balance');
             $allowanceType = (string)($row['allowanceType'] ?? '');
-            $values[] = in_array($allowanceType, ['Gas', 'Load', 'Others'], true) ? $allowanceType : null;
-            $values[] = trim((string)($row['allowanceNote'] ?? ''));
-            $values[] = decimal_value($row['cashAdvance'] ?? 0, 'Cash advance');
-            $values[] = decimal_value($row['newPcaAmount'] ?? 0, 'New PCA amount');
-            $values[] = trim((string)($row['pcaReason'] ?? ''));
-            $values[] = decimal_value($row['pcaDeduction'] ?? 0, 'PCA deduction');
-            $values[] = decimal_value($row['resultingPcaBalance'] ?? 0, 'Resulting PCA balance');
-            $values[] = (float)($row['totalPay'] ?? 0);
+            $allowanceType = trim($allowanceType);
+            $allowanceNote = trim((string)($row['allowanceNote'] ?? ''));
+            $pcaReason = trim((string)($row['pcaReason'] ?? ''));
+            if ($allowanceType !== '' && !in_array($allowanceType, ['Gas', 'Load', 'Others'], true)) {
+                respond(['error' => 'Allowance type must be Gas, Load, or Others.'], 400);
+            }
+            $legacyAllowanceUnchanged = $existingTimesheet
+                && abs($allowanceAmount - (float)$existingTimesheet['allowance_amount']) < 0.005
+                && ($allowanceType === '' ? null : $allowanceType) === $existingTimesheet['allowance_type']
+                && $allowanceNote === $existingTimesheet['allowance_note'];
+            if ($allowanceAmount > 0 && ($allowanceType === '' || $allowanceNote === '') && !$legacyAllowanceUnchanged) {
+                respond(['error' => 'An allowance requires a valid type and a descriptive note.'], 400);
+            }
+            $legacyPcaReasonUnchanged = $existingTimesheet
+                && abs($newPcaAmount - (float)$existingTimesheet['new_pca_amount']) < 0.005
+                && $pcaReason === $existingTimesheet['pca_reason'];
+            if ($newPcaAmount > 0 && $pcaReason === '' && !$legacyPcaReasonUnchanged) {
+                respond(['error' => 'A reason is required when adding a PCA loan.'], 400);
+            }
+            $allowanceType = $allowanceType === '' ? null : $allowanceType;
+            $values = [
+                $row['id'], $workerId, $weekStart, $effectiveRate, $allowanceAmount,
+                $allowanceType, $allowanceNote, $cashAdvance, $newPcaAmount,
+                $pcaReason, $pcaDeduction, $resultingPcaBalance,
+            ];
             $payrollQuery->execute($values);
+            $deleteDaysQuery->execute([$row['id']]);
+            foreach ($row['days'] as $day) {
+                $dayQuery->execute([
+                    $day['id'],
+                    $day['timesheetId'],
+                    $day['workDate'],
+                    $day['hours'],
+                    $day['siteId'],
+                ]);
+            }
         }
 
         delete_missing($pdo, 'weekly_timesheets', $payrollIds);
@@ -263,19 +370,27 @@ try {
         $positions = $pdo->query('SELECT id, title, daily_rate AS dailyRate FROM positions ORDER BY title')->fetchAll();
         $sites = $pdo->query('SELECT id, name, location FROM sites ORDER BY name')->fetchAll();
         $payroll = $pdo->query(
-            'SELECT id, worker_id AS workerId, week_start AS weekStart,
-                    sunday_hours AS sundayHours, monday_hours AS mondayHours, tuesday_hours AS tuesdayHours,
-                    wednesday_hours AS wednesdayHours, thursday_hours AS thursdayHours, friday_hours AS fridayHours,
-                    saturday_hours AS saturdayHours, sunday_site_id AS sundaySiteId, monday_site_id AS mondaySiteId,
-                    tuesday_site_id AS tuesdaySiteId, wednesday_site_id AS wednesdaySiteId, thursday_site_id AS thursdaySiteId,
-                    friday_site_id AS fridaySiteId, saturday_site_id AS saturdaySiteId, other_date AS otherDate,
-                    other_hours AS otherHours, other_site_id AS otherSiteId, effective_rate AS effectiveRate,
+            'SELECT id, worker_id AS workerId, week_start AS weekStart, effective_rate AS effectiveRate,
                     allowance_amount AS allowanceAmount, allowance_type AS allowanceType, allowance_note AS allowanceNote,
                     cash_advance AS cashAdvance, new_pca_amount AS newPcaAmount, pca_reason AS pcaReason,
                     pca_deduction AS pcaDeduction, resulting_pca_balance AS resultingPcaBalance,
-                    total_pay AS totalPay, created_at AS createdAt, updated_at AS updatedAt
+                    created_at AS createdAt, updated_at AS updatedAt
              FROM weekly_timesheets ORDER BY week_start DESC'
         )->fetchAll();
+        $timesheetDays = $pdo->query(
+            'SELECT id, timesheet_id AS timesheetId, work_date AS workDate, hours, site_id AS siteId
+             FROM timesheet_days ORDER BY work_date, id'
+        )->fetchAll();
+        $daysByTimesheet = [];
+        foreach ($timesheetDays as $day) {
+            $day['hours'] = (float)$day['hours'];
+            $daysByTimesheet[$day['timesheetId']][] = [
+                'id' => $day['id'],
+                'workDate' => $day['workDate'],
+                'hours' => $day['hours'],
+                'siteId' => $day['siteId'],
+            ];
+        }
 
         foreach ($workers as &$worker) {
             $worker['overrideRate'] = $worker['overrideRate'] === null ? '' : (float)$worker['overrideRate'];
@@ -285,12 +400,19 @@ try {
         }
         unset($worker);
         foreach ($payroll as &$record) {
-            foreach (['effectiveRate', 'allowanceAmount', 'cashAdvance', 'newPcaAmount', 'pcaDeduction', 'resultingPcaBalance', 'totalPay', 'otherHours'] as $field) {
+            foreach (['effectiveRate', 'allowanceAmount', 'cashAdvance', 'newPcaAmount', 'pcaDeduction', 'resultingPcaBalance'] as $field) {
                 $record[$field] = (float)$record[$field];
             }
-            foreach (['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as $day) {
-                $record[$day . 'Hours'] = (float)$record[$day . 'Hours'];
-            }
+            $record['days'] = $daysByTimesheet[$record['id']] ?? [];
+            $hours = array_reduce(
+                $record['days'],
+                static fn(float $sum, array $day): float => $sum + $day['hours'],
+                0.0
+            );
+            $record['totalPay'] = round(
+                ($hours / HOURS_PER_PAYABLE_DAY) * $record['effectiveRate'] + $record['allowanceAmount'] - $record['cashAdvance'] - $record['pcaDeduction'],
+                2
+            );
         }
         unset($record);
         foreach ($positions as &$position) {
